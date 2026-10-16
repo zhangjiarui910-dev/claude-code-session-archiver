@@ -1,0 +1,6 @@
+# Do not commit personal conversation archives.
+cc-session-*.json
+cc-session-*.html
+*.log
+.DS_Store
+Thumbs.db
