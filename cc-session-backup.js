@@ -22,7 +22,7 @@
 (async () => {
   'use strict';
 
-  const VERSION = '1.2';
+  const VERSION = '1.3';
   const CFG = {
     OLD_JSON: 'ask', // 'ask' = 弹窗选择上次的 JSON；'none' = 不选，直接做完整备份
     IGNORE_SESSION_MISMATCH: false, // 选的旧文件属于别的会话时是否仍然继续
@@ -359,12 +359,18 @@
   // 视野就被一下子推到更早的地方，中间那段消息根本没出现过，就会漏存。
   // 发现页面变高、又和已收集的内容接不上时，把多出来的高度补回去，回到原处。
   let lastH = 0;
+  // 补位/往下找如果连着几次都没带来新内容（在某些页面上会原地打转），就关掉，退回 1.1 的做法
+  let rescueOff = false;
+  let rescueUsed = false;
+  let rescueFails = 0;
   async function realign(items) {
+    if (rescueOff) return items;
     // 加载可能一批接一批地来，所以补完一次再看一次，直到接上或页面不再变高
     for (let k = 0; k < 10; k++) {
       const grew = scroller.scrollHeight - lastH;
       if (grew <= 1 || !order.length || items.some((it) => recs.has(it.id))) return items;
       scroller.scrollTop += grew;
+      rescueUsed = true;
       lastH = scroller.scrollHeight;
       await settle();
       items = snapshot();
@@ -373,6 +379,8 @@
   }
   // 还是接不上：一点点往下找，直到重新看到已收集的消息
   async function seekDown(fromTop, step) {
+    if (rescueOff) return null;
+    rescueUsed = true;
     for (let k = 1; k <= 40; k++) {
       scroller.scrollTop = fromTop + Math.floor((step * k) / 4);
       await settle();
@@ -641,6 +649,7 @@
 
       const prevTop = scroller.scrollTop;
       const countBefore = order.length;
+      rescueUsed = false;
       const topSeen = lastItems.find((it) => it.inView) || null; // 这一步之前，屏幕里最靠上的那条
       scroller.scrollTop = Math.max(0, prevTop - step);
       await settle();
@@ -675,16 +684,33 @@
         items = await realign(snapshot());
         m = merge(items);
         if (!m.overlap) {
-          const found = await seekDown(scroller.scrollTop, step);
+          const jumpedTop = scroller.scrollTop;
+          const jumped = items;
+          const found = await seekDown(jumpedTop, step);
           if (found) {
             items = found;
             m = merge(items);
+          }
+          if (!found || !m.added) {
+            // 往下找回来了却没有新内容：回到跳过去的位置，照 1.1 的办法先存下来（会标记可能的缺口）
+            scroller.scrollTop = jumpedTop;
+            await settle();
+            items = snapshot();
+            m = merge(items);
+            if (!m.overlap) items = jumped;
           }
         }
         if (!m.overlap) m = { added: forcePrepend(items), overlap: true };
       }
       lastItems = items;
       lastH = scroller.scrollHeight;
+
+      if (rescueUsed && order.length === countBefore) {
+        if (++rescueFails >= 3 && !rescueOff) {
+          rescueOff = true;
+          log('补位没有带来新内容，改用旧办法继续往上扫。');
+        }
+      } else if (order.length > countBefore) rescueFails = 0;
 
       // 既没有读到新消息、也没有离底部更远，就算这一步没有进展
       if (order.length > countBefore || fromBottom() > maxFromBottom + 1) noProgress = 0;
