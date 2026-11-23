@@ -22,7 +22,7 @@
 (async () => {
   'use strict';
 
-  const VERSION = '1.1';
+  const VERSION = '1.2';
   const CFG = {
     OLD_JSON: 'ask', // 'ask' = 弹窗选择上次的 JSON；'none' = 不选，直接做完整备份
     IGNORE_SESSION_MISMATCH: false, // 选的旧文件属于别的会话时是否仍然继续
@@ -355,6 +355,34 @@
   }
   const fromBottom = () => scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
 
+  // 往上滚时，页面常常在顶部补加载更早的消息。有的页面不会替我们保持位置，
+  // 视野就被一下子推到更早的地方，中间那段消息根本没出现过，就会漏存。
+  // 发现页面变高、又和已收集的内容接不上时，把多出来的高度补回去，回到原处。
+  let lastH = 0;
+  async function realign(items) {
+    // 加载可能一批接一批地来，所以补完一次再看一次，直到接上或页面不再变高
+    for (let k = 0; k < 10; k++) {
+      const grew = scroller.scrollHeight - lastH;
+      if (grew <= 1 || !order.length || items.some((it) => recs.has(it.id))) return items;
+      scroller.scrollTop += grew;
+      lastH = scroller.scrollHeight;
+      await settle();
+      items = snapshot();
+    }
+    return items;
+  }
+  // 还是接不上：一点点往下找，直到重新看到已收集的消息
+  async function seekDown(fromTop, step) {
+    for (let k = 1; k <= 40; k++) {
+      scroller.scrollTop = fromTop + Math.floor((step * k) / 4);
+      await settle();
+      const items = snapshot();
+      if (items.some((it) => recs.has(it.id))) return items;
+      if (fromBottom() <= 2) break;
+    }
+    return null;
+  }
+
   // ---------- 读取上次的备份文件（只在本机读，不上传） ----------
   function pickFile() {
     return new Promise((resolve) => {
@@ -559,6 +587,7 @@
     }
     let lastItems = snapshot();
     merge(lastItems);
+    lastH = scroller.scrollHeight;
     const streamingAtRun = order.length ? !!recs.get(order[order.length - 1]).streaming : false;
     let totalRows = null;
     for (const id of order) {
@@ -589,8 +618,13 @@
         const n = order.length;
         await sleep(400);
         await settle();
-        lastItems = snapshot();
+        lastItems = await realign(snapshot());
         merge(lastItems);
+        lastH = scroller.scrollHeight;
+        if (scroller.scrollTop > 1) {
+          topStable = 0; // 顶上又加载出了更早的内容，接着往上扫
+          continue;
+        }
         if (scroller.scrollTop <= 1 && scroller.scrollHeight === h && order.length === n) topStable++;
         else topStable = 0;
         if (++topChecks > 40) {
@@ -611,7 +645,7 @@
       scroller.scrollTop = Math.max(0, prevTop - step);
       await settle();
       steps++;
-      let items = snapshot();
+      let items = await realign(snapshot());
       // 如果这一步滚过了头（上一屏最靠上的那条已经完全掉到屏幕下方），往回补一点，
       // 保证每条消息都在屏幕里完整出现过一次
       for (let k = 0; k < 3 && topSeen; k++) {
@@ -638,11 +672,19 @@
         }
         scroller.scrollTop = Math.max(0, prevTop - step);
         await settle();
-        items = snapshot();
+        items = await realign(snapshot());
         m = merge(items);
+        if (!m.overlap) {
+          const found = await seekDown(scroller.scrollTop, step);
+          if (found) {
+            items = found;
+            m = merge(items);
+          }
+        }
         if (!m.overlap) m = { added: forcePrepend(items), overlap: true };
       }
       lastItems = items;
+      lastH = scroller.scrollHeight;
 
       // 既没有读到新消息、也没有离底部更远，就算这一步没有进展
       if (order.length > countBefore || fromBottom() > maxFromBottom + 1) noProgress = 0;
@@ -788,7 +830,14 @@
     if (reachedTop && !startConfirmed && mode !== 'incremental') {
       warnings.push('页面已滚到顶，但无法确认那就是会话的第一条（最早一行的行号不是 0）。更早的内容可能没有加载出来。');
     }
-    if (gaps) warnings.push(`扫描中有 ${gaps} 处前后没有接上，这些位置可能漏了几条消息（文件里已标记）。`);
+    if (gaps) {
+      warnings.push(
+        `扫描中有 ${gaps} 处前后没有接上，这些位置可能漏了消息（文件里已标记）。` +
+          (mode === 'incremental'
+            ? '增量备份一旦漏了，以后的增量也补不回来：建议这次改做一次完整备份（选文件时点「取消」）。'
+            : '建议稍后重新做一次完整备份。')
+      );
+    }
     const neverInView = saved.filter((r) => !r.seenInView).length;
     if (neverInView) warnings.push(`有 ${neverInView} 条消息只在屏幕外被读到，内容可能没有完全显示出来。`);
     if (streamingAtRun) warnings.push('备份时最后一条消息还在输出，保存的可能不是完整版本。下次增量备份会把它重新保存。');
@@ -802,6 +851,7 @@
     const tailAnchor = carried.concat(scannedTail).slice(-CFG.TAIL_ANCHOR);
     const now = new Date();
     const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    if (gaps || aborted) label += '-GAPS';
     const base = `cc-session-${session.pathHash}-${stamp}-${label}`;
 
     const data = {
@@ -856,7 +906,7 @@
     };
     const STATUS_TEXT = { new: '新增', updated: '有变化', rescanned: '重扫', unconfirmed: '未确认', full: '', partial: '' };
     const KIND_TEXT = { user: '用户', assistant: 'Claude', other: '其他' };
-    const ok = boundaryConfirmed || mode === 'full';
+    const ok = (boundaryConfirmed || mode === 'full') && !gaps && !aborted;
     const html =
       '<!doctype html>\n<html lang="zh-CN"><head><meta charset="utf-8">' +
       '<meta name="viewport" content="width=device-width,initial-scale=1">' +
