@@ -34,6 +34,8 @@
     RUN_TEXT: 5, // 没有编号时，连续多少条「内容在旧文件里」才算找到分界
     MIN_TEXT: 24, // 少于这么多字的内容太容易重复，不参与内容比对
     TOP_RETRIES: 4, // 到顶后再确认几次
+    STUCK_STEPS: 80, // 连续这么多步都没有新内容，才判定页面卡住
+    STUCK_WAIT_MAX_MS: 6000, // 没有新内容时，每步额外多等，最多等这么久（网络慢时给页面时间加载）
     TAIL_ANCHOR: 40, // 每个备份文件里记下最新的多少条编号，供下次定位
     BIG_TEXT_CAP: 40e6, // 旧格式文件参与内容比对的最大字符数
     LOG_EVERY: 25,
@@ -722,7 +724,12 @@
         aborted = '页面不断自动跳回底部（会话可能正在输出）';
         break;
       }
-      if (noProgress >= 40) {
+      if (noProgress > 0) {
+        // 网络慢、或页面在后台时，更早的消息加载得慢：没有进展就多等一会儿再滚
+        await sleep(Math.min(CFG.STUCK_WAIT_MAX_MS, 500 * noProgress));
+        if (document.hidden && noProgress === 3) log('这个标签页好像不在前台：请把它切回来、别最小化，浏览器会在后台暂停加载。');
+      }
+      if (noProgress >= CFG.STUCK_STEPS) {
         aborted = '连续滚了很多步都没有读到新内容（页面可能卡住了）';
         break;
       }
